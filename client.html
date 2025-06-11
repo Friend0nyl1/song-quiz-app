@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Audio Stream Player</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #0056b3; }
+        .controls { display: flex; flex-direction: column; gap: 10px; margin-top: 20px; }
+        button { padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; transition: background-color 0.3s ease; }
+        button.play { background-color: #28a745; color: white; }
+        button.play:hover { background-color: #218838; }
+        button.stop { background-color: #dc3545; color: white; }
+        button.stop:hover { background-color: #c82333; }
+        button.request { background-color: #007bff; color: white; }
+        button.request:hover { background-color: #0056b3; }
+        input[type="text"] { padding: 8px; border-radius: 4px; border: 1px solid #ddd; width: calc(100% - 100px); margin-right: 10px; }
+        .status { margin-top: 20px; padding: 10px; background-color: #e9ecef; border-radius: 5px; }
+        .status strong { color: #0056b3; }
+        .log-area { margin-top: 20px; background-color: #eee; padding: 10px; border-radius: 5px; height: 150px; overflow-y: scroll; font-size: 0.9em; white-space: pre-wrap; word-break: break-all; }
+        .error { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Live Audio Stream Player</h1>
+
+        <div class="status">
+            <p>Connection Status: <strong id="connectionStatus">Disconnected</strong></p>
+            <p>Currently Streaming: <strong id="currentSong">None</strong></p>
+            <p>Playback Position: <strong id="playbackPosition">0:00</strong> / <strong id="songDuration">0:00</strong></p>
+        </div>
+
+        <div class="controls">
+            <div>
+                <input type="text" id="songInput" placeholder="Enter song name (e.g., song1.mp3)" value="lobby.mp3">
+                <button class="request" onclick="requestStream()">Request Stream</button>
+            </div>
+            <button class="stop" onclick="stopStream()">Stop Stream</button>
+        </div>
+
+        <div class="log-area" id="log">
+            Client Log:
+        </div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script>
+        const SERVER_URL = 'http://localhost:3000'; // เปลี่ยนเป็น URL ของเซิร์ฟเวอร์ NestJS ของคุณ
+        let socket;
+        let audioContext; // ไม่ได้ใช้โดยตรงแล้ว แต่ยังคงไว้หากต้องการใช้ Web Audio API ขั้นสูง
+        let mediaSource; // สำหรับ Media Source Extensions
+        let sourceBuffer;
+        let bufferQueue = [];
+        let isBuffering = false;
+        let isPlaying = false;
+
+        // ตัวแปรสำหรับซิงค์เวลา
+        let serverSongDuration = 0; // ระยะเวลาเพลงทั้งหมดจากเซิร์ฟเวอร์
+        let serverPlaybackStartTime = 0; // Unix timestamp ที่เซิร์ฟเวอร์เริ่มเล่นเพลงปัจจุบัน
+        let serverInitialPosition = 0; // ตำแหน่งเริ่มต้นของเพลงที่เซิร์ฟเวอร์กำลังเล่นอยู่เมื่อไคลเอนต์เชื่อมต่อ
+
+        const connectionStatusEl = document.getElementById('connectionStatus');
+        const currentSongEl = document.getElementById('currentSong');
+        const playbackPositionEl = document.getElementById('playbackPosition');
+        const songDurationEl = document.getElementById('songDuration');
+        const logEl = document.getElementById('log');
+        const songInputEl = document.getElementById('songInput');
+
+        function appendLog(message, isError = false) {
+            const p = document.createElement('p');
+            p.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            if (isError) {
+                p.classList.add('error');
+            }
+            logEl.prepend(p); // Add to top
+            // Limit log entries to prevent memory issues
+            while (logEl.children.length > 50) {
+                logEl.removeChild(logEl.lastChild);
+            }
+        }
+
+        function formatTime(seconds) {
+            if (isNaN(seconds) || seconds < 0) return "0:00";
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = Math.floor(seconds % 60);
+            return `${minutes}:${remainingSeconds < 10 ? '0' : ''}${remainingSeconds}`;
+        }
+
+        // อัปเดตการแสดงผลตำแหน่งการเล่นเพลง
+        function updatePlaybackDisplay() {
+            if (isPlaying && serverSongDuration > 0 && serverPlaybackStartTime > 0) {
+                const clientCurrentTime = Date.now();
+                // คำนวณเวลาที่ผ่านไปจากจุดที่เซิร์ฟเวอร์เริ่มเล่น (รวมถึงเวลาที่ไคลเอนต์เพิ่งเชื่อมต่อ)
+                const effectiveElapsedTime = (clientCurrentTime - serverPlaybackStartTime) / 1000;
+                let currentPos = (serverInitialPosition + effectiveElapsedTime) % serverSongDuration;
+
+                playbackPositionEl.textContent = formatTime(currentPos);
+                songDurationEl.textContent = formatTime(serverSongDuration);
+            } else {
+                playbackPositionEl.textContent = '0:00';
+                songDurationEl.textContent = formatTime(serverSongDuration);
+            }
+            requestAnimationFrame(updatePlaybackDisplay);
+        }
+
+        let audioEl; // Element <audio> ที่ซ่อนไว้
+
+        function connectSocket() {
+            if (socket && socket.connected) {
+                appendLog("Already connected.");
+                return;
+            }
+
+            appendLog(`Attempting to connect to ${SERVER_URL}...`);
+            socket = io(SERVER_URL, {
+                transports: ['websocket', 'polling']
+            });
+
+            socket.on('connect', () => {
+                connectionStatusEl.textContent = 'Connected';
+                connectionStatusEl.style.color = 'green';
+                appendLog(`Connected to server! Socket ID: ${socket.id}`);
+            });
+
+            socket.on('disconnect', (reason) => {
+                connectionStatusEl.textContent = 'Disconnected';
+                connectionStatusEl.style.color = 'red';
+                appendLog(`Disconnected from server: ${reason}`, true);
+                stopPlayback();
+            });
+
+            socket.on('connect_error', (error) => {
+                connectionStatusEl.textContent = 'Connection Error';
+                connectionStatusEl.style.color = 'red';
+                appendLog(`Connection Error: ${error.message}`, true);
+                stopPlayback();
+            });
+
+            socket.on('message', (data) => {
+                appendLog(`Server Message: ${data.message}`);
+            });
+
+            socket.on('liveAudio', (chunk) => {
+                bufferQueue.push(chunk);
+                if (sourceBuffer && !sourceBuffer.updating) {
+                    processBufferQueue();
+                }
+            });
+
+            socket.on('liveStreamStarted', (status) => {
+                if (status.isStreaming) {
+                    currentSongEl.textContent = status.song;
+                    serverPlaybackStartTime = status.serverStartTime; // เวลาที่เซิร์ฟเวอร์เริ่มเล่นเพลงปัจจุบัน
+                    serverSongDuration = status.duration; // ระยะเวลาเพลงทั้งหมด
+                    serverInitialPosition = status.currentPosition; // ตำแหน่งเริ่มต้นที่เซิร์ฟเวอร์กำลังเล่น
+                    appendLog(`${status} live stream started.`);
+                    appendLog(`Live stream started: ${serverInitialPosition} (Duration: ${formatTime(status.duration)})`);
+                    appendLog(`Server started playing at: ${formatTime(status.currentPosition)}`);
+
+                    // เริ่มต้นการเล่น
+                    startPlayback();
+                } else {
+                    currentSongEl.textContent = 'None';
+                    serverSongDuration = 0;
+                    serverPlaybackStartTime = 0;
+                    serverInitialPosition = 0;
+                    appendLog('Live stream stopped on server.');
+                    stopPlayback();
+                }
+            });
+
+            socket.on('playbackError', (error) => {
+                appendLog(`Playback Error from server: ${error.message}`, true);
+                stopPlayback();
+            });
+        }
+
+        // ฟังก์ชันสำหรับเริ่มต้น Audio Element และ MediaSource
+        function startPlayback() {
+            if (isPlaying) {
+                stopPlayback(); // หยุดของเดิมก่อนถ้ามี
+            }
+
+            if (!audioEl) {
+                audioEl = new Audio();
+                audioEl.autoplay = true;
+                audioEl.controls = false;
+                audioEl.style.display = 'none';
+                document.body.appendChild(audioEl);
+
+                audioEl.addEventListener('error', (e) => {
+                    appendLog(`Audio element error: ${audioEl.error.code} - ${audioEl.error.message}`, true);
+                    stopPlayback();
+                });
+                audioEl.addEventListener('ended', () => {
+                    appendLog("Audio element ended unexpectedly. This shouldn't happen with continuous MSE.", true);
+                    // อาจจะต้องพิจารณาการจัดการเมื่อ stream จบ (เช่น reconnection)
+                });
+            }
+
+            mediaSource = new MediaSource();
+            mediaSource.addEventListener('sourceopen', handleSourceOpen);
+            mediaSource.addEventListener('sourceclose', () => {
+                appendLog("MediaSource closed.");
+                if (isPlaying) {
+                    appendLog("MediaSource closed unexpectedly during playback.", true);
+                    stopPlayback();
+                }
+            });
+            mediaSource.addEventListener('sourceended', () => {
+                appendLog("MediaSource ended.");
+            });
+
+            audioEl.src = URL.createObjectURL(mediaSource);
+            audioEl.load();
+
+            // สำคัญ: การเล่นต้องเกิดขึ้นหลังจากการโต้ตอบของผู้ใช้
+            // หรือถ้าเราเชื่อว่ามี interaction แล้ว ให้ลอง play ทันที
+            audioEl.play().then(() => {
+                isPlaying = true;
+                appendLog("Audio playback started successfully.");
+                // การตั้ง currentTime ให้ถูกต้องใน MSE ต้องทำหลังจากมีข้อมูลใน sourceBuffer
+                // และต้องอิงตาม "buffered.start(0)" หรือ "buffered.end(0)"
+                if (sourceBuffer && sourceBuffer.buffered.length > 0) {
+                    // กำหนด currentTime โดยอิงจากเวลาเริ่มต้นของเซิร์ฟเวอร์
+                    // เราจะพยายามตั้งให้ใกล้เคียงที่สุดกับ serverInitialPosition
+                    // แต่อาจมีดีเลย์เล็กน้อยเนื่องจากการบัฟเฟอร์
+                    // audioEl.currentTime = serverInitialPosition;
+                    // ในการสตรีมสด การตั้ง currentTime ที่แน่นอนทำได้ยาก
+                    // เราจะให้มันเล่นไปเรื่อยๆ และจะซิงค์ด้วยการแสดงผล
+                    appendLog(`Attempting to set currentTime to ${formatTime(serverInitialPosition)}`);
+                }
+            }).catch(e => {
+                appendLog(`Error playing audio (Autoplay Policy?): ${e.message}. Please click anywhere on the page to enable audio.`, true);
+                isPlaying = false;
+            });
+        }
+
+
+        let queueProcessingTimeout;
+
+        function handleSourceOpen() {
+            appendLog("MediaSource opened.");
+            try {
+                sourceBuffer = mediaSource.addSourceBuffer('audio/webm; codecs="opus"');
+                appendLog("SourceBuffer created successfully.");
+
+                sourceBuffer.onupdateend = () => {
+                    // appendLog("SourceBuffer update ended.");
+                    isBuffering = false;
+                    processBufferQueue();
+
+                    // หาก SourceBuffer มีข้อมูลและเพลงยังไม่ถูกเล่น (เช่นเพิ่งเชื่อมต่อ)
+                    // และเบราว์เซอร์อนุญาตให้เล่นอัตโนมัติ (เช่นมีการโต้ตอบแล้ว)
+                    if (audioEl && audioEl.paused && isPlaying) {
+                        // ลองเล่นอีกครั้งหากหยุดชั่วคราว
+                        audioEl.play().catch(e => {
+                            appendLog(`Error resuming playback after buffer update: ${e.message}`, true);
+                        });
+                    }
+                };
+
+                sourceBuffer.onerror = (e) => {
+                    appendLog(`SourceBuffer error: ${e.message || e.error}`, true);
+                    stopPlayback();
+                };
+
+                // เริ่มประมวลผลคิวเมื่อ SourceBuffer พร้อม
+                processBufferQueue();
+
+            } catch (e) {
+                appendLog(`Error creating SourceBuffer: ${e.message || e.name}. Make sure your browser supports 'audio/webm; codecs="opus"'`, true);
+                appendLog('Possible reasons: Incorrect MIME type or codec. Server might be sending wrong format.', true);
+            }
+        }
+
+        function processBufferQueue() {
+            if (isBuffering || bufferQueue.length === 0 || !sourceBuffer || sourceBuffer.updating) {
+                return;
+            }
+
+            const chunk = bufferQueue.shift();
+            try {
+                isBuffering = true;
+                sourceBuffer.appendBuffer(new Uint8Array(chunk));
+
+                clearTimeout(queueProcessingTimeout);
+                queueProcessingTimeout = setTimeout(() => {
+                    if (sourceBuffer.updating) {
+                        appendLog("SourceBuffer updateend timeout, forcing re-check.", true);
+                        isBuffering = false;
+                        processBufferQueue();
+                    }
+                }, 500); // รอ 500ms
+            } catch (e) {
+                appendLog(`Error appending buffer: ${e.message}. Queue size: ${bufferQueue.length}`, true);
+                isBuffering = false;
+                // ในกรณีที่ appendBuffer ล้มเหลว อาจจะต้องทิ้งข้อมูลในคิวบางส่วน
+                // หรือพยายามเชื่อมต่อใหม่ ขึ้นอยู่กับลักษณะของ error
+            }
+        }
+
+        function stopPlayback() {
+            if (isPlaying) {
+                if (audioEl) {
+                    audioEl.pause();
+                    audioEl.src = ''; // เคลียร์ source
+                    audioEl.load(); // โหลดเพื่อรีเซ็ต
+                    if (audioEl.parentNode) {
+                        audioEl.parentNode.removeChild(audioEl); // ลบ element ออก
+                    }
+                    audioEl = null;
+                }
+                if (mediaSource && mediaSource.readyState === 'open') {
+                    try {
+                        mediaSource.endOfStream();
+                    } catch (e) {
+                        appendLog(`Error calling endOfStream: ${e.message}`, true);
+                    }
+                }
+                mediaSource = null;
+                sourceBuffer = null;
+                bufferQueue = [];
+                isBuffering = false;
+                isPlaying = false;
+                appendLog("Playback stopped.");
+            }
+            currentSongEl.textContent = 'None';
+            playbackPositionEl.textContent = '0:00';
+            songDurationEl.textContent = '0:00';
+            serverSongDuration = 0;
+            serverPlaybackStartTime = 0;
+            serverInitialPosition = 0;
+            clearTimeout(queueProcessingTimeout);
+        }
+
+
+        // Global functions for buttons
+        function requestStream() {
+            if (!socket || !socket.connected) {
+                appendLog("Not connected to server. Please wait or refresh.", true);
+                connectSocket(); // ลองเชื่อมต่อใหม่
+                return;
+            }
+            const songName = songInputEl.value.trim();
+            if (songName) {
+                appendLog(`Requesting stream for: ${songName}`);
+                socket.emit('requestFileStream', { songName: songName });
+                // Note: Playback will start after server responds with liveStreamStarted
+            } else {
+                appendLog("Please enter a song name.", true);
+            }
+        }
+
+        function stopStream() {
+            if (socket && socket.connected) {
+                appendLog("Sending stop stream request.");
+                socket.emit('stopFileStream');
+                stopPlayback(); // หยุดการเล่นบนไคลเอนต์ทันที
+            } else {
+                appendLog("Not connected to server to stop stream.", true);
+                stopPlayback(); // ถ้าไม่ได้เชื่อมต่อ ก็หยุดการเล่นบนไคลเอนต์เฉยๆ
+            }
+        }
+
+        // เชื่อมต่อเมื่อโหลดหน้าเสร็จ
+        window.onload = () => {
+            connectSocket();
+            updatePlaybackDisplay(); // เริ่มอัปเดต UI ตั้งแต่แรก
+        };
+
+    </script>
+</body>
+</html>
